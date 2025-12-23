@@ -8,7 +8,8 @@ const { getEuropeGames } = require('./europe');
 const { getJapanGames } = require('./asia');
 
 const app = express();
-const PORT = 3000;
+// process.env.PORT 是 Render 自动注入的环境变量
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 
