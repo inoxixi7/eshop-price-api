@@ -2,6 +2,7 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const NodeCache = require('node-cache'); // 1. 引入缓存库
 
 const { getAmericasGames } = require('./americas');
 const { getEuropeGames } = require('./europe');
@@ -10,6 +11,9 @@ const { getJapanGames } = require('./asia');
 const app = express();
 // process.env.PORT 是 Render 自动注入的环境变量
 const PORT = process.env.PORT || 3000;
+
+// 2. 初始化缓存：stdTTL = 3600秒 (缓存1小时)，checkperiod = 600秒 (每10分钟清理一次过期缓存)
+const myCache = new NodeCache({ stdTTL: 3600, checkperiod: 600 });
 
 app.use(cors());
 
@@ -88,89 +92,97 @@ function mergePriceData(game, priceObj) {
 
     return result;
 }
-
-// ================= API 路由 =================
-
-// 1. 美洲区 (支持搜索 ?q=Mario)
-app.get('/api/americas', async (req, res) => {
+// --- 3. 封装一个带缓存的处理函数 (通用逻辑) ---
+// keyPrefix: 'us_', 'eu_', 'jp_' 用来区分不同地区
+// fetchFunction: 真正去爬虫的函数
+async function handleRequestWithCache(req, res, keyPrefix, fetchFunction) {
     try {
         const query = req.query.q || '';
         const limit = parseInt(req.query.limit) || 20;
-        // 如果想支持搜索，你需要修改 getAmericasGames 接收 query 参数，这里暂且默认
-        const games = await getAmericasGames(query, limit);
+
+        // 生成唯一的缓存 Key，例如 "us_Mario_20"
+        // 只要查询词和数量一样，Key 就一样
+        const cacheKey = `${keyPrefix}_${query}_${limit}`;
+
+        // A. 先检查缓存里有没有
+        const cachedData = myCache.get(cacheKey);
+        if (cachedData) {
+            console.log(`⚡️ 命中缓存: ${cacheKey} (无需请求任天堂)`);
+            return res.json(cachedData); // 直接返回旧数据
+        }
+
+        // B. 缓存里没有，才去请求任天堂
+        console.log(`🐢 未命中缓存，正在请求任天堂: ${cacheKey}`);
+        const games = await fetchFunction(query, limit);
         const ids = games.map(g => g.nsuid);
 
-        const [pUS, pMX, pBR, pAR] = await Promise.all([
-            getPrices('US', ids), getPrices('MX', ids), getPrices('BR', ids), getPrices('AR', ids)
-        ]);
+        // 根据地区判断用哪个国家代码查价格
+        let pricePromises = [];
+        if (keyPrefix === 'us') {
+            pricePromises = [getPrices('US', ids), getPrices('MX', ids), getPrices('BR', ids), getPrices('AR', ids)];
+        } else if (keyPrefix === 'eu') {
+            pricePromises = [getPrices('GB', ids), getPrices('NO', ids), getPrices('ZA', ids)];
+        } else if (keyPrefix === 'jp') {
+            pricePromises = [getPrices('JP', ids)];
+        }
 
-        const results = games.map(g => ({
-            ...g,
-            prices: {
-                US: mergePriceData(g, pUS.find(p => p.title_id == g.nsuid)),
-                MX: mergePriceData(g, pMX.find(p => p.title_id == g.nsuid)),
-                BR: mergePriceData(g, pBR.find(p => p.title_id == g.nsuid)),
-                AR: mergePriceData(g, pAR.find(p => p.title_id == g.nsuid))
+        const pricesRaw = await Promise.all(pricePromises);
+
+        // 数据合并逻辑 (简化版，根据你之前的逻辑调整)
+        const results = games.map(g => {
+            let pricesObj = {};
+            if (keyPrefix === 'us') {
+                pricesObj = {
+                    US: mergePriceData(g, pricesRaw[0].find(p => p.title_id == g.nsuid)),
+                    MX: mergePriceData(g, pricesRaw[1].find(p => p.title_id == g.nsuid)),
+                    BR: mergePriceData(g, pricesRaw[2].find(p => p.title_id == g.nsuid)),
+                    AR: mergePriceData(g, pricesRaw[3].find(p => p.title_id == g.nsuid))
+                };
+            } else if (keyPrefix === 'eu') {
+                // ... 欧服合并逻辑
+                 pricesObj = {
+                    GB: mergePriceData(g, pricesRaw[0].find(p => p.title_id == g.nsuid)),
+                    NO: mergePriceData(g, pricesRaw[1].find(p => p.title_id == g.nsuid)),
+                    ZA: mergePriceData(g, pricesRaw[2].find(p => p.title_id == g.nsuid))
+                };
+            } else {
+                 pricesObj = { JP: mergePriceData(g, pricesRaw[0].find(p => p.title_id == g.nsuid)) };
             }
-        }));
+            return { ...g, prices: pricesObj };
+        });
 
-        res.json({ source: 'Americas', count: results.length, data: results });
+        const finalResponse = { 
+            source: 'Live Fetch', 
+            count: results.length, 
+            data: results,
+            cached_at: new Date().toISOString() // 标记一下这是什么时候存的
+        };
+
+        // C. 拿到新数据后，存入缓存 (下次别人搜就快了)
+        myCache.set(cacheKey, { ...finalResponse, source: 'Cache' });
+
+        res.json(finalResponse);
+
     } catch (err) {
+        console.error(err);
         res.status(500).json({ error: err.message });
     }
+}
+
+// ================= 路由简化 =================
+
+app.get('/api/americas', (req, res) => {
+    handleRequestWithCache(req, res, 'us', getAmericasGames);
 });
 
-// 2. 欧洲区
-app.get('/api/europe', async (req, res) => {
-    try {
-        const query = req.query.q || '';
-        const limit = parseInt(req.query.limit) || 20;
-        const games = await getEuropeGames(query, limit);
-        const ids = games.map(g => g.nsuid);
-
-        const [pGB, pNO, pZA] = await Promise.all([
-            getPrices('GB', ids), getPrices('NO', ids), getPrices('ZA', ids)
-        ]);
-
-        const results = games.map(g => ({
-            ...g,
-            prices: {
-                GB: mergePriceData(g, pGB.find(p => p.title_id == g.nsuid)),
-                NO: mergePriceData(g, pNO.find(p => p.title_id == g.nsuid)),
-                ZA: mergePriceData(g, pZA.find(p => p.title_id == g.nsuid))
-            }
-        }));
-
-        res.json({ source: 'Europe', count: results.length, data: results });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+app.get('/api/europe', (req, res) => {
+    handleRequestWithCache(req, res, 'eu', getEuropeGames);
 });
 
-// 3. 日本区
-app.get('/api/japan', async (req, res) => {
-    try {
-        const query = req.query.q || '';
-        const limit = parseInt(req.query.limit) || 20;
-        const games = await getJapanGames(query, limit);
-        const ids = games.map(g => g.nsuid);
-
-        const pJP = await getPrices('JP', ids);
-
-        const results = games.map(g => ({
-            ...g,
-            prices: {
-                JP: mergePriceData(g, pJP.find(p => p.title_id == g.nsuid))
-            }
-        }));
-
-        res.json({ source: 'Japan', count: results.length, data: results });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+app.get('/api/japan', (req, res) => {
+    handleRequestWithCache(req, res, 'jp', getJapanGames);
 });
 
 app.listen(PORT, () => {
-    console.log(`✅ API 服务已重启: http://localhost:${PORT}`);
-    console.log(`👉 验证美服价格: http://localhost:${PORT}/api/americas?limit=10`);
+    console.log(`✅ 带缓存的 API 服务器已启动: Port ${PORT}`);
 });
